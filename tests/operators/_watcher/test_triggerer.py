@@ -1,4 +1,4 @@
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from packaging.version import Version
@@ -482,3 +482,36 @@ class TestWatcherTriggerProducerSkipped:
         await self.trigger._log_startup_events()
 
         mock_producer_status.assert_called_once()
+
+
+class TestResolveRuntimeContext:
+    """Tests for WatcherTrigger._resolve_runtime_context."""
+
+    def test_resolves_run_id_from_task_instance(self):
+        trigger = WatcherTrigger(
+            model_unique_id="model.pkg.my_model",
+            producer_task_id="producer",
+            dag_id="dag_1",
+            run_id=None,
+            map_index=None,
+        )
+        mock_ti = Mock()
+        mock_ti.run_id = "manual__2026-01-01"
+        mock_ti.map_index = -1
+        trigger.task_instance = mock_ti
+
+        trigger._resolve_runtime_context()
+
+        assert trigger.run_id == "manual__2026-01-01"
+        assert trigger.map_index == -1
+
+    def test_raises_when_task_instance_missing(self):
+        trigger = WatcherTrigger(
+            model_unique_id="model.pkg.my_model",
+            producer_task_id="producer",
+            dag_id="dag_1",
+            run_id=None,
+        )
+
+        with pytest.raises(RuntimeError, match="task_instance is not available"):
+            trigger._resolve_runtime_context()

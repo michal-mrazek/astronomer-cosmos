@@ -44,8 +44,8 @@ class WatcherTrigger(BaseTrigger):
         model_unique_id: str,
         producer_task_id: str,
         dag_id: str,
-        run_id: str,
-        map_index: int | None,
+        run_id: str | None = None,
+        map_index: int | None = None,
         poke_interval: float = 5.0,
         is_test_sensor: bool = False,
         # Accepted for upgrade-compatibility only: triggers serialized before the
@@ -224,7 +224,43 @@ class WatcherTrigger(BaseTrigger):
             event_data["outlet_uris"] = outlet_uris
         return event_data
 
+    def _resolve_runtime_context(self) -> None:
+        """Resolve run_id and map_index from self.task_instance when started via start_from_trigger.
+
+        When BaseConsumerSensor uses start_from_trigger (Airflow >= 2.10), run_id and
+        map_index are not known at DAG parse time and are passed as None in
+        trigger_kwargs. The triggerer framework sets self.task_instance on the trigger
+        before calling run(), so we can read the values directly from it.
+
+        Raises RuntimeError if task_instance is unavailable or run_id cannot be resolved.
+        """
+        ti = getattr(self, "task_instance", None)
+        if ti is None:
+            raise RuntimeError(
+                f"WatcherTrigger for '{self.model_unique_id}' requires run_id but it was not provided "
+                f"and self.task_instance is not available."
+            )
+
+        resolved_run_id = getattr(ti, "run_id", None)
+        if not resolved_run_id:
+            raise RuntimeError(
+                f"WatcherTrigger for '{self.model_unique_id}': task_instance is present but "
+                f"run_id is empty or None. task_instance type: {type(ti).__name__}"
+            )
+
+        self.run_id = resolved_run_id
+        self.map_index = getattr(ti, "map_index", -1)
+
+        logger.debug(
+            "Resolved runtime context for '%s': run_id=%s, map_index=%s",
+            self.model_unique_id,
+            self.run_id,
+            self.map_index,
+        )
+
     async def run(self) -> AsyncIterator[TriggerEvent]:
+        if self.run_id is None:
+            self._resolve_runtime_context()
         logger.info("Starting WatcherTrigger for model: %s", self.model_unique_id)
         await self._log_startup_events()
 

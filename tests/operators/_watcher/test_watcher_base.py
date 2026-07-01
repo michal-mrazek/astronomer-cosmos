@@ -4,6 +4,7 @@ import pytest
 from airflow.exceptions import AirflowException, AirflowSkipException
 
 from cosmos.operators._watcher.base import BaseConsumerSensor, _process_dbt_log_event
+from cosmos.operators._watcher.triggerer import WatcherEventReason
 from cosmos.operators.local import DbtRunLocalOperator
 
 
@@ -188,3 +189,86 @@ class TestHandleNoDbtNodeStatus:
 
         assert result is False
         assert sensor.poke_retry_number == 1
+
+
+class TestStartFromTrigger:
+    """Tests for start_from_trigger configuration and retry logic."""
+
+    def _make_sensor(self, **kwargs):
+        class SubclassBaseConsumerSensor(BaseConsumerSensor, DbtRunLocalOperator):
+            something_to_be_implemented = True
+
+        defaults = {
+            "task_id": "test_sensor",
+            "producer_task_id": "dbt_run_local",
+            "profile_config": None,
+            "project_dir": "/tmp/sample_project",
+            "extra_context": {"dbt_node_config": {"unique_id": "model.pkg.my_model"}},
+        }
+        defaults.update(kwargs)
+        return SubclassBaseConsumerSensor(**defaults)
+
+    @patch("cosmos.operators._watcher.base.settings.enable_start_from_trigger", True)
+    @patch("cosmos.operators._watcher.base.START_FROM_TRIGGER_AVAILABLE", True)
+    def test_should_not_configure_start_from_trigger_when_not_deferrable(self):
+        sensor = self._make_sensor(deferrable=False)
+        assert sensor._should_configure_start_from_trigger() is False
+
+    @patch("cosmos.operators._watcher.base.settings.enable_start_from_trigger", False)
+    @patch("cosmos.operators._watcher.base.START_FROM_TRIGGER_AVAILABLE", True)
+    def test_should_not_configure_when_setting_disabled(self):
+        sensor = self._make_sensor(deferrable=True)
+        assert sensor._should_configure_start_from_trigger() is False
+        assert sensor.start_from_trigger is False
+
+    @patch("cosmos.operators._watcher.base.settings.enable_start_from_trigger", True)
+    @patch("cosmos.operators._watcher.base.START_FROM_TRIGGER_AVAILABLE", False)
+    def test_should_not_configure_when_airflow_too_old(self):
+        sensor = self._make_sensor(deferrable=True)
+        assert sensor._should_configure_start_from_trigger() is False
+
+    @patch("cosmos.operators._watcher.base.settings.enable_start_from_trigger", False)
+    def test_execute_complete_node_failed_retry_falls_back_to_local(self):
+        """On retry with start_from_trigger, NODE_FAILED triggers local fallback."""
+        sensor = self._make_sensor()
+        sensor.start_from_trigger = True
+
+        mock_ti = Mock()
+        mock_ti.try_number = 2
+        context = {"ti": mock_ti, "run_id": "run_123"}
+
+        with patch.object(sensor, "_fallback_to_non_watcher_run", return_value=True) as mock_fallback:
+            with patch("cosmos.operators._watcher.base.get_xcom_val", return_value=None):
+                sensor.execute_complete(context, {"status": "failed", "reason": WatcherEventReason.NODE_FAILED})
+
+        mock_fallback.assert_called_once_with(try_number=2, context=context)
+
+    @patch("cosmos.operators._watcher.base.settings.enable_start_from_trigger", False)
+    def test_execute_complete_node_failed_first_try_raises(self):
+        """On first try (no retry), NODE_FAILED raises AirflowException."""
+        sensor = self._make_sensor()
+        sensor.start_from_trigger = False
+
+        mock_ti = Mock()
+        mock_ti.try_number = 1
+        context = {"ti": mock_ti, "run_id": "run_123"}
+
+        with patch("cosmos.operators._watcher.base.get_xcom_val", return_value=None):
+            with pytest.raises(AirflowException, match="failed"):
+                sensor.execute_complete(context, {"status": "failed", "reason": WatcherEventReason.NODE_FAILED})
+
+    @patch("cosmos.operators._watcher.base.settings.enable_start_from_trigger", False)
+    def test_execute_complete_producer_skipped_falls_back(self):
+        """PRODUCER_SKIPPED always falls back to local dbt run."""
+        sensor = self._make_sensor()
+        sensor.start_from_trigger = False
+
+        mock_ti = Mock()
+        mock_ti.try_number = 1
+        context = {"ti": mock_ti, "run_id": "run_123"}
+
+        with patch.object(sensor, "_fallback_to_non_watcher_run", return_value=True) as mock_fallback:
+            with patch("cosmos.operators._watcher.base.get_xcom_val", return_value=None):
+                sensor.execute_complete(context, {"status": "failed", "reason": WatcherEventReason.PRODUCER_SKIPPED})
+
+        mock_fallback.assert_called_once_with(try_number=1, context=context)

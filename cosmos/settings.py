@@ -102,5 +102,10 @@ no_analytics = convert_to_boolean(os.getenv("SCARF_NO_ANALYTICS"))
 enable_debug_mode = conf.getboolean("cosmos", "enable_debug_mode", fallback=False)
 debug_memory_poll_interval_seconds = conf.getfloat("cosmos", "debug_memory_poll_interval_seconds", fallback=0.5)
 
+# Watcher start_from_trigger: when enabled and Airflow >= 2.10, consumer sensors
+# skip the initial worker slot and go directly to the triggerer. Disable to fall
+# back to the defer-after-poke path.
+enable_start_from_trigger = conf.getboolean("cosmos", "enable_start_from_trigger", fallback=True)
+
 # Experimental: use orjson for faster dbt manifest.json parsing (disabled by default)
 enable_orjson_parser = conf.getboolean("cosmos", "enable_orjson_parser", fallback=False)

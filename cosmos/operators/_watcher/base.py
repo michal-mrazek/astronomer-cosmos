@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from airflow.exceptions import AirflowException, AirflowSkipException
+from packaging.version import Version
 
 from cosmos import settings
 from cosmos.config import ProfileConfig
@@ -98,6 +99,8 @@ _DBT_ERROR_EVENTS_TYPES = frozenset(
 _DBT_NODE_STATUS_EVENT_TYPES = frozenset({"NodeStart", "NodeCompiling", "NodeExecuting", "NodeFinished"})
 
 _DBT_EVENT_ALLOWLIST = _DBT_ERROR_EVENTS_TYPES | _DBT_NODE_STATUS_EVENT_TYPES
+
+START_FROM_TRIGGER_AVAILABLE = AIRFLOW_VERSION >= Version("2.10.0")
 
 
 def _process_dbt_log_event(task_instance: Any, dbt_log: dict[str, Any]) -> None:
@@ -445,6 +448,47 @@ class BaseConsumerSensor(BaseSensorOperator):
         self.deferrable = deferrable
         self.model_unique_id = extra_context.get("dbt_node_config", {}).get("unique_id")
 
+        self.start_from_trigger = self._should_configure_start_from_trigger()
+        if self.start_from_trigger:
+            self._configure_start_from_trigger()
+
+    def _should_configure_start_from_trigger(self) -> bool:
+        return self.deferrable and START_FROM_TRIGGER_AVAILABLE and settings.enable_start_from_trigger
+
+    def _configure_start_from_trigger(self) -> None:
+        """Configure start_from_trigger.
+
+        When enabled, the scheduler sends the consumer task directly to the triggerer
+        without allocating a worker slot first. The trigger resolves run_id and map_index
+        at runtime from self.task_instance.
+        """
+        try:
+            from airflow.triggers.base import StartTriggerArgs
+        except ImportError:
+            logger.debug(
+                "start_from_trigger not available: StartTriggerArgs could not be imported (Airflow %s).",
+                AIRFLOW_VERSION,
+            )
+            return
+
+        self.start_trigger_args = StartTriggerArgs(
+            trigger_cls="cosmos.operators._watcher.triggerer.WatcherTrigger",
+            trigger_kwargs={
+                "model_unique_id": self.model_unique_id,
+                "producer_task_id": self.producer_task_id,
+                "dag_id": self.dag_id,
+                "run_id": None,  # resolved by trigger at runtime via self.task_instance
+                "map_index": None,  # resolved by trigger at runtime via self.task_instance
+                "poke_interval": self.poke_interval,
+                "is_test_sensor": self.is_test_sensor,
+            },
+            next_method="execute_complete",
+            next_kwargs=None,
+            timeout=self.execution_timeout,
+        )
+        self.start_from_trigger = True
+        logger.debug("start_from_trigger enabled for consumer '%s'.", self.model_unique_id)
+
     @property
     def is_test_sensor(self) -> bool:
         """Whether this sensor watches aggregated test results instead of individual node results."""
@@ -622,12 +666,33 @@ class BaseConsumerSensor(BaseSensorOperator):
             task_ids=self.producer_task_id,
         )
         _log_dbt_event(dbt_events)
+
+        # When start_from_trigger is active and this is a retry, the trigger re-reads
+        # stale failure from XCom. Fall back to running dbt locally.
+        _is_start_from_trigger_retry = self.start_from_trigger and context["ti"].try_number > 1
+
         if reason == WatcherEventReason.NODE_FAILED:
+            if _is_start_from_trigger_retry:
+                logger.info(
+                    "Retry #%s via start_from_trigger: node '%s' failed. Falling back to running dbt directly.",
+                    context["ti"].try_number,
+                    self.model_unique_id,
+                )
+                self._fallback_to_non_watcher_run(try_number=context["ti"].try_number, context=context)
+                return
             raise AirflowException(
                 f"dbt {self._resource_label.lower()} '{self.model_unique_id}' failed. Review the producer task '{self.producer_task_id}' logs for details."
             )
 
         if reason == WatcherEventReason.PRODUCER_FAILED:
+            if _is_start_from_trigger_retry:
+                logger.info(
+                    "Retry #%s via start_from_trigger: producer failed for '%s'. Falling back to running dbt directly.",
+                    context["ti"].try_number,
+                    self.model_unique_id,
+                )
+                self._fallback_to_non_watcher_run(try_number=context["ti"].try_number, context=context)
+                return
             raise AirflowException(
                 f"Watcher producer task '{self.producer_task_id}' failed before reporting results for {self._resource_label.lower()} '{self.model_unique_id}'. Check its logs for the underlying error."
             )
